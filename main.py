@@ -1,10 +1,8 @@
 """
-Pakistan Medicine Chatbot - FastAPI + Google Gemini API
-GENERIC: No Hardcoded Answers - Handles ANY Medicine/Disease Question
-Using Google's genai library instead of Groq
+Pakistan Medicine Chatbot - FastAPI + Groq API
+With LangSmith Tracking - 2 SEPARATE traceable functions
 """
  
-from http import client
 import os
 import json
 import re
@@ -12,16 +10,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-from google import genai
+import requests
 from dotenv import load_dotenv
+from langsmith import traceable
  
-# STEP 1: Load environment variables (API key must be in .env as GEMINI_API_KEY)
 load_dotenv()
  
-# STEP 2: Initialize FastAPI
-app = FastAPI(title="Pakistan Medicine Chatbot", version="4.0.0")
+app = FastAPI(title="Pakistan Medicine Chatbot", version="3.0.0")
  
-# STEP 3: Add CORS middleware (same as before)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,15 +26,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
  
-# STEP 4: Initialize Google Gemini Client (CHANGED FROM GROQ)
-try:
-    genai_client = genai.Client()  # Gets GEMINI_API_KEY from environment
-    print("✅ Google Gemini API client initialized successfully")
-except Exception as e:
-    print(f"❌ Error initializing Gemini client: {e}")
-    raise ValueError("Failed to initialize Google Gemini API")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY not found in .env file")
  
-# STEP 5: Pydantic Models (SAME AS BEFORE)
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_HEADERS = {
+    "Authorization": f"Bearer {GROQ_API_KEY}",
+    "Content-Type": "application/json"
+}
+ 
 class Message(BaseModel):
     role: str
     content: str
@@ -46,21 +44,20 @@ class Message(BaseModel):
 class MedicineQuery(BaseModel):
     query: str
     context: Optional[List[Message]] = None
-
-# GENERIC SYSTEM PROMPT - NO HARDCODED ANSWERS
+ 
 PHARMACY_SYSTEM_PROMPT = """You are a Pakistan Medicine Expert Pharmacist. Answer ONLY medicine, disease, symptom, and medical condition questions.
 
 YOUR ROLE:
 - Answer questions about medicines available in Pakistan
 - Explain diseases, symptoms, and how medicines treat them
 - Provide dosage, salt/ingredient, purpose, and OTC/Rx information
-- Write in conversational 3-4 lines (like talking to a friend)
+- Write in conversational 2-3 lines (like talking to a friend)
 - Use context from previous messages
 - Add appropriate disclaimers when giving medical advice
 
 RESPONSE FORMAT:
 Always return ONLY this JSON:
-{"ans": "3-4 line conversational answer with disclaimer if needed"}
+{"ans": "Not more than 2-3 line conversational answer with disclaimer if needed"}
 
 WHAT TO INCLUDE IN ANSWER:
 1. Medicine name (actual Pakistan brand if available)
@@ -75,7 +72,7 @@ ANSWER STYLE:
 - Simple language (no heavy medical jargon)
 - Practical and actionable advice
 - Empathetic and supportive tone
-- 3-4 lines maximum
+- Restrict it to 2-3 lines maximum
 - Include relevant information naturally in conversation
 
 DISCLAIMER RULES:
@@ -100,8 +97,6 @@ DISCLAIMER FORMAT:
 - Keep SHORT and contextual (1 line)
 - Use natural language
 
-
-
 MEDICINE KNOWLEDGE:
 You have knowledge of all Pakistan pharmaceutical brands including:
 - Pain/Fever: Panadol, Calpol, Brufen, Disprol, Panadol Extra
@@ -118,7 +113,7 @@ CRITICAL RULES:
 1. ONLY answer medicine/disease/symptom/medical questions
 2. If question is NOT medical (sports, politics, cooking, tech, entertainment, weather, etc) - REJECT it
 3. For rejected questions, respond: {"ans": "I'm a medical chatbot specialized in medicines and diseases in Pakistan. Please ask about medicines, symptoms, diseases, treatments, or any medical concern."}
-4. For emergencies (Heart attack, severe bleeding, unconscious, difficulty breathing, poisoning, overdose, severe trauma) - RESPOND: {"ans": "⚠️ EMERGENCY! Go to hospital or call 1122 immediately. This needs urgent medical care. Do NOT delay."}
+4. For emergencies (Heart attack, severe bleeding, unconscious, difficulty breathing, poisoning, overdose, severe trauma) - RESPOND: {"ans": "⚠️ EMERGENCY! Go to nearest hospital immediately or call 1122. This needs urgent medical care. Do NOT delay."}
 5. Return ONLY "ans" field - NO other fields
 6. NO hardcoded examples - generate answer based on actual question
 7. Use context from previous messages to understand patient better
@@ -129,17 +124,15 @@ REMEMBER:
 ✓ Generic answers for ANY medicine/disease question
 ✓ NO hardcoded example answers
 ✓ Always check if question is medical-related first
-✓ Conversational 3-4 lines only
+✓ Conversational 2-3 lines only
 ✓ Include medicine name, salt, purpose, dosage, OTC/Rx status
 ✓ Add disclaimer ONLY when giving medical advice/recommendations
 ✓ Format disclaimer with \n\n before it
 ✓ Return ONLY {"ans": "answer with or without disclaimer"}
 """
 
- 
-# STEP 7: Parse response function (SLIGHTLY CHANGED FOR GEMINI)
-def parse_gemini_response(response_text: str) -> str:
-    """Parse Gemini response and extract 'ans' field"""
+def parse_groq_response(response_text: str) -> str:
+    """Parse Groq response and extract 'ans' field"""
     try:
         response_text = str(response_text).strip()
         
@@ -171,74 +164,110 @@ def parse_gemini_response(response_text: str) -> str:
         
     except Exception:
         return response_text
- 
-# STEP 8: Main endpoint (CHANGED TO USE GEMINI)
 
-from langsmith import traceable
+# TRACEABLE FUNCTION 1: System Prompt
+@traceable(name="system-prompt", run_type="prompt")
+def track_system_prompt(system_prompt: str) -> str:
+    """LangSmith tracks complete system prompt with all instructions"""
+    return system_prompt
 
-@traceable(name="medicine-query", run_type="llm")
-def call_gemini_api(full_prompt: str) -> str:
-    """Call Gemini API - tracked with input prompt and output ans"""
-    response = genai_client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=full_prompt
-    )
-    return response.text
+# TRACEABLE FUNCTION 2: User Message (context + question)
+@traceable(name="user-message", run_type="prompt")
+def track_user_message(user_message: str) -> str:
+    """LangSmith tracks user message with context and current question"""
+    return user_message
 
+# TRACEABLE FUNCTION 3: Groq API Call
+@traceable(name="groq-api-call", run_type="llm")
+def call_groq_api(system_prompt: str, user_message: str) -> str:
+    """Call Groq API - LangSmith tracks input and output separately"""
+    
+    # Track system prompt separately
+    track_system_prompt(system_prompt)
+    
+    # Track user message separately
+    track_user_message(user_message)
+    
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_message
+            }
+        ],
+        "max_tokens": 400,
+        "temperature": 0.1
+    }
+    
+    response = requests.post(GROQ_API_URL, headers=GROQ_HEADERS, json=payload, timeout=20)
+    result = response.json()
+    return result["choices"][0]["message"]["content"]
 
-# In your async endpoint
 @app.post("/api/medicine")
 async def get_medicine_info(request: MedicineQuery):
-    """Medicine chatbot endpoint"""
+    """
+    Medicine chatbot endpoint
+    Input: {"query": "any medicine/disease/symptom question"}
+    Output: {"ans": "conversational answer about medicine, salt, disease, purpose"}
+    """
     
     if not request.query or request.query.strip() == "":
         raise HTTPException(status_code=400, detail="Query cannot be empty")
     
     try:
-        # Build context
+        # Build context string from previous messages
         context_str = ""
         if request.context and len(request.context) > 0:
-            recent_context = request.context[-5:] if len(request.context) > 5 else request.context
+            # Keep last 15 messages for context
+            recent_context = request.context[-15:] if len(request.context) > 15 else request.context
             context_str = "Previous conversation:\n"
             for msg in recent_context:
                 context_str += f"{msg.role.upper()}: {msg.content}\n"
             context_str += "\n"
         
-        # Build prompt
-        full_prompt = f"""{PHARMACY_SYSTEM_PROMPT}
-
-{context_str}Current question: {request.query}
+        # Build user message (context + current question)
+        user_message = f"""{context_str}Current question: {request.query}
 
 RESPOND ONLY WITH VALID JSON (no markdown, no extra text):
 {{"ans": "your answer"}}"""
         
-        # CALL TRACEABLE FUNCTION (input = full_prompt, output = response_text)
-        response_text = call_gemini_api(full_prompt)
+        # Call the 3 traceable functions
+        # Function 1: Track system prompt
+        # Function 2: Track user message
+        # Function 3: Make API call (calls 1 and 2 internally)
+        try:
+            response_text = call_groq_api(PHARMACY_SYSTEM_PROMPT, user_message)
+            
+        except requests.exceptions.Timeout:
+            return {"ans": "Request timeout - please try again"}
+        except requests.exceptions.RequestException as e:
+            return {"ans": f"API Error: {str(e)}"}
         
         if not response_text:
-            return {"ans": "No response received from API"}
+            return {"ans": "No response received"}
         
-        # Parse to get ans field
-        ans = parse_gemini_response(response_text)
+        # Parse response to get 'ans' field
+        ans = parse_groq_response(response_text)
         
         return {"ans": ans}
         
     except Exception as e:
         return {"ans": f"Error: {str(e)}"}
-    
-    
-# STEP 12: Health check endpoint (SAME AS BEFORE)
+ 
 @app.get("/")
-def health_check():
+async def health_check():
     """Health check endpoint"""
     return {
         "status": "running",
-        "name": "Pakistan Medicine Chatbot (Gemini)",
-        "version": "4.0.0",
-        "model": "Google Gemini 2.0 Flash"
+        "name": "Pakistan Medicine Chatbot",
+        "version": "3.0.0"
     }
  
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
- 
